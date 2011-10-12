@@ -28,6 +28,7 @@ In addition to I/O events, the `IOLoop` can also schedule time-based events.
 
 from __future__ import with_statement
 
+import datetime
 import errno
 import heapq
 import os
@@ -102,7 +103,7 @@ class IOLoop(object):
     NONE = 0
     READ = _EPOLLIN
     WRITE = _EPOLLOUT
-    ERROR = _EPOLLERR | _EPOLLHUP | _EPOLLRDHUP
+    ERROR = _EPOLLERR | _EPOLLHUP
 
     def __init__(self, impl=None):
         self._impl = impl or _poll()
@@ -351,6 +352,10 @@ class IOLoop(object):
         The deadline argument can either be a unix timestamp
         with microsecond precision (float) or a datetime.timedelta object.
         Returns a handle that may be passed to remove_timeout to cancel.
+
+        ``deadline`` may be a number denoting a unix timestamp (as returned
+        by ``time.time()`` or a ``datetime.timedelta`` object for a deadline
+        relative to the current time.
         """
         timeout = _Timeout(deadline, stack_context.wrap(callback))
         heapq.heappush(self._timeouts, timeout)
@@ -415,15 +420,18 @@ class _Timeout(object):
     __slots__ = ['deadline', 'callback']
 
     def __init__(self, deadline, callback):
-        """ deadline can either be a unix timestamp with microsecond precision or a timedelta object """
-        self.deadline = self.convert_to_float_if_necessary(deadline)
+        if isinstance(deadline, (int, long, float)):
+            self.deadline = deadline
+        elif isinstance(deadline, datetime.timedelta):
+            self.deadline = time.time() + _Timeout.timedelta_to_seconds(deadline)
+        else:
+            raise TypeError("Unsupported deadline %r" % deadline)
         self.callback = callback
 
-    def convert_to_float_if_necessary(self, float_or_timedelta):
-        if not isinstance(float_or_timedelta, datetime.timedelta):
-            return float_or_timedelta
-        deadline_datetime = datetime.datetime.now() + float_or_timedelta
-        return time.mktime(deadline_datetime.timetuple()) + deadline_datetime.microsecond/1000000.0
+    @staticmethod
+    def timedelta_to_seconds(td):
+        """Equivalent to td.total_seconds() (introduced in python 2.7)."""
+        return (td.microseconds + (td.seconds + td.days * 24 * 3600) * 10**6) / float(10**6)
 
     # Comparison methods to sort by deadline, with object id as a tiebreaker
     # to guarantee a consistent ordering.  The heapq module uses __le__
@@ -472,7 +480,7 @@ class PeriodicCallback(object):
     def _schedule_next(self):
         if self._running:
             current_time = time.time()
-            while self._next_timeout < current_time:
+            while self._next_timeout <= current_time:
                 self._next_timeout += self.callback_time / 1000.0
             self.io_loop.add_timeout(self._next_timeout, self._run)
 

@@ -4,7 +4,6 @@ from __future__ import with_statement
 from tornado.escape import utf8, _unicode, native_str
 from tornado.httpclient import HTTPRequest, HTTPResponse, HTTPError, AsyncHTTPClient, main
 from tornado.httputil import HTTPHeaders
-from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream, SSLIOStream
 from tornado import stack_context
 from tornado.util import b
@@ -110,13 +109,12 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                 key = object()
                 self.active[key] = (request, callback)
                 _HTTPConnection(self.io_loop, self, request,
-                                functools.partial(self._on_fetch_complete,
-                                                  key, callback),
+                                functools.partial(self._release_fetch, key),
+                                callback,
                                 self.max_buffer_size)
 
-    def _on_fetch_complete(self, key, callback, response):
+    def _release_fetch(self, key):
         del self.active[key]
-        callback(response)
         self._process_queue()
 
 
@@ -124,12 +122,14 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
 class _HTTPConnection(object):
     _SUPPORTED_METHODS = set(["GET", "HEAD", "POST", "PUT", "DELETE"])
 
-    def __init__(self, io_loop, client, request, callback, max_buffer_size):
+    def __init__(self, io_loop, client, request, release_callback,
+                 final_callback, max_buffer_size):
         self.start_time = time.time()
         self.io_loop = io_loop
         self.client = client
         self.request = request
-        self.callback = callback
+        self.release_callback = release_callback
+        self.final_callback = final_callback
         self.code = None
         self.headers = None
         self.chunks = None
@@ -195,7 +195,7 @@ class _HTTPConnection(object):
                                        max_buffer_size=max_buffer_size)
             timeout = min(request.connect_timeout, request.request_timeout)
             if timeout:
-                self._connect_timeout = self.io_loop.add_timeout(
+                self._timeout = self.io_loop.add_timeout(
                     self.start_time + timeout,
                     self._on_timeout)
             self.stream.set_close_callback(self._on_close)
@@ -205,12 +205,13 @@ class _HTTPConnection(object):
     def _on_timeout(self):
         self._timeout = None
         self._run_callback(HTTPResponse(self.request, 599,
+                                        request_time=time.time() - self.start_time,
                                         error=HTTPError(599, "Timeout")))
         self.stream.close()
 
     def _on_connect(self, parsed):
         if self._timeout is not None:
-            self.io_loop.remove_callback(self._timeout)
+            self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
         if self.request.request_timeout:
             self._timeout = self.io_loop.add_timeout(
@@ -267,13 +268,20 @@ class _HTTPConnection(object):
         self.stream.write(b("\r\n").join(request_lines) + b("\r\n\r\n"))
         if self.request.body is not None:
             self.stream.write(self.request.body)
-        self.stream.read_until(b("\r\n\r\n"), self._on_headers)
+        self.stream.read_until_regex(b("\r?\n\r?\n"), self._on_headers)
+
+    def _release(self):
+        if self.release_callback is not None:
+            release_callback = self.release_callback
+            self.release_callback = None
+            release_callback()
 
     def _run_callback(self, response):
-        if self.callback is not None:
-            callback = self.callback
-            self.callback = None
-            callback(response)
+        self._release()
+        if self.final_callback is not None:
+            final_callback = self.final_callback
+            self.final_callback = None
+            final_callback(response)
 
     @contextlib.contextmanager
     def cleanup(self):
@@ -281,16 +289,19 @@ class _HTTPConnection(object):
             yield
         except Exception, e:
             logging.warning("uncaught exception", exc_info=True)
-            self._run_callback(HTTPResponse(self.request, 599, error=e))
+            self._run_callback(HTTPResponse(self.request, 599, error=e, 
+                                request_time=time.time() - self.start_time,
+                                ))
 
     def _on_close(self):
         self._run_callback(HTTPResponse(
                 self.request, 599,
+                request_time=time.time() - self.start_time,
                 error=HTTPError(599, "Connection closed")))
 
     def _on_headers(self, data):
         data = native_str(data.decode("latin1"))
-        first_line, _, header_data = data.partition("\r\n")
+        first_line, _, header_data = data.partition("\n")
         match = re.match("HTTP/1.[01] ([0-9]+)", first_line)
         assert match
         self.code = int(match.group(1))
@@ -346,12 +357,15 @@ class _HTTPConnection(object):
             new_request.max_redirects -= 1
             del new_request.headers["Host"]
             new_request.original_request = original_request
-            callback = self.callback
-            self.callback = None
-            self.client.fetch(new_request, callback)
+            final_callback = self.final_callback
+            self.final_callback = None
+            self._release()
+            self.client.fetch(new_request, final_callback)
+            self.stream.close()
             return
         response = HTTPResponse(original_request,
                                 self.code, headers=self.headers,
+                                request_time=time.time() - self.start_time,
                                 buffer=buffer,
                                 effective_url=self.request.url)
         self._run_callback(response)

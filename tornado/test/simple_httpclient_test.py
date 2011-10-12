@@ -5,11 +5,10 @@ import gzip
 import logging
 import socket
 
-from contextlib import closing
 from tornado.ioloop import IOLoop
 from tornado.simple_httpclient import SimpleAsyncHTTPClient, _DEFAULT_CA_CERTS
 from tornado.test.httpclient_test import HTTPClientCommonTestCase, ChunkHandler, CountdownHandler, HelloWorldHandler
-from tornado.testing import AsyncHTTPTestCase, LogTrapTestCase, get_unused_port
+from tornado.testing import AsyncHTTPTestCase, LogTrapTestCase
 from tornado.util import b
 from tornado.web import RequestHandler, Application, asynchronous, url
 
@@ -100,6 +99,15 @@ class SimpleHTTPClientTestCase(AsyncHTTPTestCase, LogTrapTestCase):
         self.assertEqual(set(seen), set([0, 1, 2, 3]))
         self.assertEqual(len(self.triggers), 0)
 
+    def test_redirect_connection_limit(self):
+        # following redirects should not consume additional connections
+        client = SimpleAsyncHTTPClient(self.io_loop, max_clients=1,
+                                       force_instance=True)
+        client.fetch(self.get_url('/countdown/3'), self.stop,
+                     max_redirects=3)
+        response = self.wait()
+        response.rethrow()
+
     def test_default_certificates_exist(self):
         open(_DEFAULT_CA_CERTS).close()
 
@@ -126,34 +134,22 @@ class SimpleHTTPClientTestCase(AsyncHTTPTestCase, LogTrapTestCase):
         self.assertTrue(response.effective_url.endswith("/countdown/2"))
         self.assertTrue(response.headers["Location"].endswith("/countdown/1"))
 
-    def test_connect_timeout(self):
-        # create a socket and bind it to a port, but don't
-        # call accept so the connection will timeout.
-        #get_unused_port()
-        port = get_unused_port()
-
-        with closing(socket.socket()) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('127.0.0.1', port))
-            sock.listen(1)
-            self.http_client.fetch("http://localhost:%d/" % port,
-                                   self.stop,
-                                   connect_timeout=0.1)
-            response = self.wait()
-            self.assertEqual(response.code, 599)
-            self.assertEqual(str(response.error), "HTTP 599: Timeout")
-
     def test_request_timeout(self):
         response = self.fetch('/hang', request_timeout=0.1)
         self.assertEqual(response.code, 599)
+        self.assertTrue(0.099 < response.request_time < 0.11, response.request_time)
         self.assertEqual(str(response.error), "HTTP 599: Timeout")
 
     def test_ipv6(self):
+        if not socket.has_ipv6:
+            # python compiled without ipv6 support, so skip this test
+            return
         try:
             self.http_server.listen(self.get_http_port(), address='::1')
         except socket.gaierror, e:
             if e.errno == socket.EAI_ADDRFAMILY:
-                # ipv6 is not configured on this system, so skip this test
+                # python supports ipv6, but it's not configured on the network
+                # interface, so skip this test.
                 return
             raise
         url = self.get_url("/hello").replace("localhost", "[::1]")

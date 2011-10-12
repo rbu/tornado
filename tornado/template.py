@@ -57,7 +57,7 @@ interesting. Syntax for the templates::
 
 Unlike most other template systems, we do not put any restrictions on the
 expressions you can include in your statements. if and for blocks get
-translated exactly into Python, do you can do complex expressions like::
+translated exactly into Python, you can do complex expressions like::
 
    {% for student in [p for p in people if p.student and p.age > 23] %}
      <li>{{ escape(student.name) }}</li>
@@ -82,6 +82,91 @@ Typical applications do not create `Template` or `Loader` instances by
 hand, but instead use the `render` and `render_string` methods of
 `tornado.web.RequestHandler`, which load templates automatically based
 on the ``template_path`` `Application` setting.
+
+Syntax Reference
+----------------
+
+Template expressions are surrounded by double curly braces: ``{{ ... }}``.
+The contents may be any python expression, which will be escaped according
+to the current autoescape setting and inserted into the output.  Other
+template directives use ``{% %}``.  These tags may be escaped as ``{{!``
+and ``{%!`` if you need to include a literal ``{{`` or ``{%`` in the output.
+
+``{% apply *function* %}...{% end %}``
+    Applies a function to the output of all template code between ``apply``
+    and ``end``::
+
+        {% apply linkify %}{{name}} said: {{message}}{% end %}
+
+``{% autoescape *function* %}``
+    Sets the autoescape mode for the current file.  This does not affect
+    other files, even those referenced by ``{% include %}``.  Note that
+    autoescaping can also be configured globally, at the `Application`
+    or `Loader`.::
+
+        {% autoescape xhtml_escape %}
+        {% autoescape None %}
+
+``{% block *name* %}...{% end %}``
+    Indicates a named, replaceable block for use with ``{% extends %}``.
+    Blocks in the parent template will be replaced with the contents of
+    the same-named block in a child template.::
+
+        <!-- base.html -->
+        <title>{% block title %}Default title{% end %}</title>
+
+        <!-- mypage.html -->
+        {% extends "base.html" %}
+        {% block title %}My page title{% end %}
+
+``{% comment ... %}``
+    A comment which will be removed from the template output.  Note that
+    there is no ``{% end %}`` tag; the comment goes from the word ``comment``
+    to the closing ``%}`` tag.
+
+``{% extends *filename* %}``
+    Inherit from another template.  Templates that use ``extends`` should
+    contain one or more ``block`` tags to replace content from the parent
+    template.  Anything in the child template not contained in a ``block``
+    tag will be ignored.  For an example, see the ``{% block %}`` tag.
+
+``{% for *var* in *expr* %}...{% end %}``
+    Same as the python ``for`` statement.
+    
+``{% from *x* import *y* %}``
+    Same as the python ``import`` statement.
+
+``{% if *condition* %}...{% elif *condition* %}...{% else %}...{% end %}``
+    Conditional statement - outputs the first section whose condition is
+    true.  (The ``elif`` and ``else`` sections are optional)
+
+``{% import *module* %}``
+    Same as the python ``import`` statement.
+
+``{% include *filename* %}``
+    Includes another template file.  The included file can see all the local
+    variables as if it were copied directly to the point of the ``include``
+    directive (the ``{% autoescape %}`` directive is an exception).
+    Alternately, ``{% module Template(filename, **kwargs) %}`` may be used
+    to include another template with an isolated namespace.
+
+``{% module *expr* %}``
+    Renders a `~tornado.web.UIModule`.  The output of the ``UIModule`` is
+    not escaped::
+
+        {% module Template("foo.html", arg=42) %}
+
+``{% raw *expr* %}``
+    Outputs the result of the given expression without autoescaping.
+
+``{% set *x* = *y* %}``
+    Sets a local variable.
+
+``{% try %}...{% except %}...{% finally %}...{% end %}``
+    Same as the python ``try`` statement.
+
+``{% while *condition* %}... {% end %}``
+    Same as the python ``while`` statement.
 """
 
 from __future__ import with_statement
@@ -117,6 +202,7 @@ class Template(object):
             self.autoescape = loader.autoescape
         else:
             self.autoescape = _DEFAULT_AUTOESCAPE
+        self.namespace = loader.namespace if loader else {}
         reader = _TemplateReader(name, escape.native_str(template_string))
         self.file = _File(_parse(reader, self))
         self.code = self._generate_python(loader, compress_whitespace)
@@ -142,6 +228,7 @@ class Template(object):
             "_utf8": escape.utf8,  # for internal use
             "_string_types": (unicode, bytes_type),
         }
+        namespace.update(self.namespace)
         namespace.update(kwargs)
         exec self.compiled in namespace
         execute = namespace["_execute"]
@@ -183,7 +270,7 @@ class Template(object):
 
 class BaseLoader(object):
     """Base class for template loaders."""
-    def __init__(self, autoescape=_DEFAULT_AUTOESCAPE):
+    def __init__(self, autoescape=_DEFAULT_AUTOESCAPE, namespace=None):
         """Creates a template loader.
 
         root_directory may be the empty string if this loader does not
@@ -193,6 +280,7 @@ class BaseLoader(object):
         in the template namespace, such as "xhtml_escape".
         """
         self.autoescape = autoescape
+        self.namespace = namespace or {}
         self.templates = {}
 
     def reset(self):
@@ -223,7 +311,6 @@ class Loader(BaseLoader):
     def __init__(self, root_directory, **kwargs):
         super(Loader, self).__init__(**kwargs)
         self.root = os.path.abspath(root_directory)
-
 
     def resolve_path(self, name, parent_path=None):
         if parent_path and not parent_path.startswith("<") and \
@@ -282,6 +369,7 @@ class _File(_Node):
         writer.write_line("def _execute():")
         with writer.indent():
             writer.write_line("_buffer = []")
+            writer.write_line("_append = _buffer.append")
             self.body.generate(writer)
             writer.write_line("return _utf8('').join(_buffer)")
 
@@ -359,9 +447,10 @@ class _ApplyBlock(_Node):
         writer.write_line("def %s():" % method_name)
         with writer.indent():
             writer.write_line("_buffer = []")
+            writer.write_line("_append = _buffer.append")
             self.body.generate(writer)
             writer.write_line("return _utf8('').join(_buffer)")
-        writer.write_line("_buffer.append(%s(%s()))" % (
+        writer.write_line("_append(%s(%s()))" % (
             self.method, method_name))
 
 
@@ -410,7 +499,7 @@ class _Expression(_Node):
             # so we have to convert to utf8 again.
             writer.write_line("_tmp = _utf8(%s(_tmp))" %
                               writer.current_template.autoescape)
-        writer.write_line("_buffer.append(_tmp)")
+        writer.write_line("_append(_tmp)")
 
 class _Module(_Expression):
     def __init__(self, expression):
@@ -432,7 +521,7 @@ class _Text(_Node):
             value = re.sub(r"(\s*\n\s*)", "\n", value)
 
         if value:
-            writer.write_line('_buffer.append(%r)' % escape.utf8(value))
+            writer.write_line('_append(%r)' % escape.utf8(value))
 
 
 class ParseError(Exception):

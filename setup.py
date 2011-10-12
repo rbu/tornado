@@ -33,7 +33,7 @@ if "linux" in sys.platform.lower() and not python_26:
     extensions.append(distutils.core.Extension(
         "tornado.epoll", ["tornado/epoll.c"]))
 
-version = "2.0git"
+version = "2.1.1"
 
 if major >= 3:
     import setuptools  # setuptools is required for use_2to3
@@ -45,7 +45,7 @@ distutils.core.setup(
     packages = ["tornado", "tornado.test", "tornado.platform"],
     package_data = {
         "tornado": ["ca-certificates.crt"],
-        "tornado.test": ["README", "test.crt", "test.key"],
+        "tornado.test": ["README", "test.crt", "test.key", "static/robots.txt"],
         },
     ext_modules = extensions,
     author="Facebook",
